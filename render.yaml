@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: your-bot-name
+    runtime: python
+    buildCommand: pip install --platform manylinux2014_x86_64 --target ./python -r requirements.txt
+    startCommand: python bot.py
