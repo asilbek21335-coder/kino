@@ -139,13 +139,8 @@ async def webhook_watchdog():
             print(f"⚠️ Watchdog xatosi: {e}")
 
 
-# ======================== ✅ TUZATILGAN Middleware: activity tracking ========================
+# ======================== Activity tracking ========================
 async def track_activity(update: Update, context: CallbackContext):
-    """
-    Har qanday xabar/callback da:
-    - Agar foydalanuvchi bazada yo'q bo'lsa → qo'shadi
-    - Agar bor bo'lsa → last_activity yangilaydi
-    """
     if not update.effective_user:
         return
     user = update.effective_user
@@ -158,7 +153,6 @@ async def track_activity(update: Update, context: CallbackContext):
         return
     _last_activity_cache[user_id] = now
     try:
-        # ✅ TUZATILDI: register_user_start — yangi bo'lsa qo'shadi, eski bo'lsa last_activity yangilaydi
         await register_user_start(user_id)
     except Exception as e:
         print(f"track_activity xatosi: {e}")
@@ -193,37 +187,103 @@ async def send_ad(bot, chat_id):
         print(f"Reklama yuborishda xatolik: {e}")
 
 
+# ======================== URL YORDAMCHI FUNKSIYA ========================
+def build_channel_url(sub_type: str, identifier: str):
+    """
+    Har xil formatdagi identifier'dan to'g'ri Telegram URL yasaydi.
+    Noto'g'ri bo'lsa None qaytaradi.
+    """
+    if not identifier:
+        return None
+    ident = identifier.strip()
+    if not ident:
+        return None
+
+    # Allaqachon to'liq URL bo'lsa
+    if ident.startswith("http://") or ident.startswith("https://"):
+        return ident
+
+    # Invite link (t.me/+... yoki t.me/joinchat/...)
+    if "t.me/+" in ident or "joinchat" in ident:
+        return f"https://{ident.lstrip('@')}"
+
+    # t.me/... bilan boshlanadigan
+    if ident.startswith("t.me/"):
+        return f"https://{ident}"
+
+    # @username yoki username
+    if sub_type in ("telegram", "group", "bot"):
+        username = ident.lstrip("@").split("/")[-1].split("?")[0]
+        if not username:
+            return None
+        if sub_type == "bot":
+            return f"https://t.me/{username}?start=start"
+        return f"https://t.me/{username}"
+
+    if sub_type == "invite":
+        return f"https://t.me/{ident.lstrip('@')}"
+
+    if sub_type in ("youtube", "instagram", "website"):
+        return ident if ident.startswith("http") else f"https://{ident}"
+
+    # Fallback
+    return ident if ident.startswith("http") else f"https://{ident}"
+
+
 # ======================== Telegram a'zolik tekshiruvi ========================
 async def check_telegram_membership(bot, user_id, sub_data):
+    """
+    True  → foydalanuvchi a'zo
+    False → a'zo emas
+    None  → tekshirib bo'lmadi (kanal topilmadi / bot admin emas)
+    """
     try:
         chat_id = None
         if sub_data.get("chat_id"):
             chat_id = sub_data["chat_id"]
         else:
-            identifier = sub_data["identifier"]
-            if identifier.startswith("@"):
-                chat_id = identifier
-            elif "t.me/" in identifier:
+            identifier = (sub_data.get("identifier") or "").strip()
+            if not identifier:
+                return None
+
+            # To'liq URL bo'lsa
+            if identifier.startswith("http"):
                 if "t.me/+" in identifier or "joinchat" in identifier:
                     try:
                         chat = await bot.get_chat(identifier)
                         chat_id = chat.id
                     except Exception as e:
-                        print(f"Zayafka linkdan chat olishda xatolik: {e}")
+                        print(f"ℹ️ Invite linkdan chat olish imkonsiz: {e}")
                         return None
                 else:
-                    parts = identifier.split("/")
-                    if len(parts) >= 2:
-                        chat_id = "@" + parts[-1]
+                    part = identifier.rstrip("/").split("/")[-1].split("?")[0]
+                    if part:
+                        chat_id = "@" + part
+                    else:
+                        return None
+            elif identifier.startswith("@"):
+                chat_id = identifier
+            elif identifier.startswith("t.me/"):
+                part = identifier.rstrip("/").split("/")[-1].split("?")[0]
+                chat_id = "@" + part
             else:
                 chat_id = "@" + identifier.lstrip("@")
+
         if not chat_id:
             return None
+
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        return member.status in ["member", "administrator", "creator"]
+        return member.status in ("member", "administrator", "creator", "restricted")
     except Exception as e:
+        msg = str(e).lower()
+        if "chat not found" in msg:
+            print(f"⚠️ Chat topilmadi: {sub_data.get('identifier')}")
+            return None
+        if "bot is not a member" in msg or "not enough rights" in msg:
+            print(f"⚠️ Bot kanalga admin emas: {sub_data.get('identifier')}")
+            return None
         print(f"Membership check error: {e}")
-        return False
+        return None
 
 
 # ======================== Majburiy obuna interfeysi ========================
@@ -244,44 +304,53 @@ async def show_mandatory_subs(update: Update, context: CallbackContext):
 
     text = "🔔 <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:</b>\n\n"
     url_buttons = []
+    skipped = []
 
     for idx, sub in enumerate(incomplete, start=1):
         sub_type = sub["type"]
         identifier = sub["identifier"]
         button_text = f"📢 {idx}-kanal"
 
-        if sub_type in ("telegram", "group"):
-            if identifier.startswith("@"):
-                url = f"https://t.me/{identifier[1:]}"
-            elif identifier.startswith("https://"):
-                url = identifier
-            else:
-                url = f"https://t.me/{identifier}"
-        elif sub_type == "invite":
-            url = identifier
-        elif sub_type == "bot":
-            bot_username = identifier.replace("@", "").replace("https://t.me/", "").split("?")[0].split("/")[-1]
-            url = f"https://t.me/{bot_username}?start=start"
-        elif sub_type in ("youtube", "instagram", "website"):
-            url = identifier
-        else:
-            url = identifier
+        url = build_channel_url(sub_type, identifier)
+        if not url:
+            skipped.append(f"{idx}-{identifier}")
+            print(f"⚠️ URL yasab bo'lmadi: {identifier} (tur: {sub_type})")
+            continue
+
+        # XAVFSIZLIK: URL http/https bilan boshlanishi shart
+        if not (url.startswith("http://") or url.startswith("https://")):
+            skipped.append(f"{idx}-{identifier} (noto'g'ri URL)")
+            print(f"⚠️ Noto'g'ri URL o'tkazib yuborildi: {url}")
+            continue
 
         url_buttons.append([InlineKeyboardButton(button_text, url=url)])
+
+    # Bitta ham URL bo'lmasa — xato bermaslik uchun True qaytaramiz
+    if not url_buttons:
+        print(f"⚠️ Barcha URL'lar noto'g'ri, o'tkazib yuborildi: {skipped}")
+        return True
 
     confirm_button = [[InlineKeyboardButton("✅ Obuna bo'ldim", callback_data="confirm_all_subs")]]
     reply_markup = InlineKeyboardMarkup(url_buttons + confirm_button)
 
     if "mandatory_msg_id" in context.user_data:
         try:
-            await context.bot.delete_message(chat_id=user_id, message_id=context.user_data["mandatory_msg_id"])
-        except:
+            await context.bot.delete_message(
+                chat_id=user_id,
+                message_id=context.user_data["mandatory_msg_id"]
+            )
+        except Exception:
             pass
 
-    sent_msg = await update.message.reply_text(
-        text, reply_markup=reply_markup, parse_mode="HTML", disable_web_page_preview=True
-    )
-    context.user_data["mandatory_msg_id"] = sent_msg.message_id
+    try:
+        sent_msg = await update.message.reply_text(
+            text, reply_markup=reply_markup,
+            parse_mode="HTML", disable_web_page_preview=True
+        )
+        context.user_data["mandatory_msg_id"] = sent_msg.message_id
+    except Exception as e:
+        print(f"❌ show_mandatory_subs xatosi: {e}")
+
     return False
 
 
@@ -324,15 +393,16 @@ async def check_and_handle_mandatory_subs(update: Update, context: CallbackConte
                         await set_user_completed_sub(user_id, sub["id"], False)
                     return (sub, False)
                 else:
-                    return (sub, already_completed)
+                    # None — tekshirib bo'lmadi → foydalanuvchini bloklamaymiz
+                    return (sub, True)
             else:
                 return (sub, already_completed)
         except asyncio.TimeoutError:
             print(f"⚠️ Obuna timeout: {sub['identifier']}")
-            return (sub, False)
+            return (sub, True)
         except Exception as e:
             print(f"check_sub xatosi: {e}")
-            return (sub, False)
+            return (sub, True)
 
     results = await asyncio.gather(*[check_sub(sub) for sub in subs], return_exceptions=False)
 
@@ -384,7 +454,10 @@ async def confirm_all_subs_callback(update: Update, context: CallbackContext):
             else:
                 return (sub, True)
         except asyncio.TimeoutError:
-            return (sub, False)
+            return (sub, True)
+        except Exception as e:
+            print(f"check_single_sub xatosi: {e}")
+            return (sub, True)
 
     results = await asyncio.gather(*[check_single_sub(sub) for sub in still_incomplete])
 
